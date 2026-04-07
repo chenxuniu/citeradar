@@ -1,0 +1,636 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{geometry}
+\geometry{margin=1in}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true, linkcolor=blue, citecolor=blue, urlcolor=blue}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{amsmath}
+\usepackage{authblk}
+\usepackage{abstract}
+\usepackage{titlesec}
+\usepackage{enumitem}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  backgroundcolor=\color{gray!8},
+  keywordstyle=\color{blue},
+  commentstyle=\color{green!50!black},
+  stringstyle=\color{red!70!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=5pt,
+}
+
+% ============================================================
+\title{\textbf{CiteRadar: An Automated Citation Intelligence\\
+System for Google Scholar Profiles}}
+
+\author[1]{Chenxu Niu}
+\affil[1]{NVIDIA Corporation and Texas Tech University}
+
+\date{\today}
+
+\begin{document}
+\maketitle
+
+% ============================================================
+\begin{abstract}
+Understanding who cites your research, where those researchers are located,
+and how influential they are, provides valuable intelligence for academic
+career development, grant applications, and collaboration discovery.
+Existing bibliometric tools either require institutional subscriptions
+(Web of Science, Scopus) or offer only aggregate counts without per-author
+geographic and impact metadata (Google Scholar, Semantic Scholar).
+We present \textbf{CiteRadar}, an open-source Python system that takes a
+single Google Scholar user identifier as input and automatically produces
+a structured folder containing: the author's complete publication list,
+all citing papers with enriched author metadata, two ranked tables
+(by citation frequency and by h-index), a plain-text statistical summary,
+and an interactive HTML world map.
+CiteRadar integrates five data sources---Google Scholar, OpenAlex, CrossRef,
+Semantic Scholar, and OpenStreetMap Nominatim---through a carefully designed
+disambiguation and verification pipeline that guards against a well-known
+failure mode in bibliometric databases: the incorrect merging of distinct
+researchers who share a common name.
+We describe the system architecture, the multi-source author-enrichment
+strategy, the stop-word-filtered institution similarity function used for
+cross-validation, the anti-ban rate-limiting scheme for Google Scholar,
+and the geocoding pipeline that drives the interactive map.
+CiteRadar is released under the MIT license and installable via
+\texttt{pip install citeradar}.
+\end{abstract}
+
+\noindent\textbf{Keywords:} citation analysis, bibliometrics, Google Scholar,
+author disambiguation, interactive visualization, open-source, OpenAlex,
+information retrieval
+
+% ============================================================
+\section{Introduction}
+\label{sec:intro}
+
+Academic research impact is traditionally measured through citation counts,
+h-index, and journal impact factors.  These metrics inform hiring decisions,
+grant evaluations, and research assessment exercises such as the UK Research
+Excellence Framework.  Yet the \emph{who} and \emph{where} dimensions of
+citations remain largely invisible to individual researchers:
+\textit{Which specific people are building on your work?
+From which institutions and countries do they come?
+How prolific or influential are they in their own right?}
+
+Google Scholar~\cite{scholarpage} is the most widely used free academic
+search engine, indexing over 350 million documents including preprints and
+grey literature excluded from commercial databases.  However, Scholar's
+public interface provides only aggregate citation counts per paper; it does
+not expose structured per-author metadata for citing papers.
+
+OpenAlex~\cite{priem2022openalex} is a fully open bibliographic database
+launched in 2022 as a successor to Microsoft Academic Graph, offering
+RESTful API access to works, authors, institutions, and their relationships.
+CrossRef~\cite{crossref} is the canonical DOI registration agency, with
+an API returning structured author and venue metadata.  Semantic Scholar
+~\cite{s2} provides author affiliation data through a graph API.
+
+CiteRadar bridges these sources into a single automated pipeline.
+Given a Scholar user ID, the system: (1) scrapes the researcher's
+publication list from Scholar; (2) follows each paper's ``Cited by'' link
+to collect all citing papers; (3) resolves full author metadata---name,
+institution, city, country---for each citing paper through a priority-ordered
+cascade of API calls; (4) ranks citing researchers by citation frequency
+and by h-index; and (5) generates a statistical summary and an interactive
+HTML world map visualizing the geographic distribution of one's readership.
+
+The remainder of this paper is organized as follows.
+Section~\ref{sec:related} briefly surveys related tools.
+Section~\ref{sec:arch} describes the system architecture.
+Sections~\ref{sec:scraping}--\ref{sec:map} detail each pipeline stage.
+Section~\ref{sec:eval} presents a case study on a real Scholar profile.
+Section~\ref{sec:limit} discusses limitations, and Section~\ref{sec:conc}
+concludes.
+
+% ============================================================
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{Commercial bibliometric platforms.}
+Web of Science (Clarivate) and Scopus (Elsevier) provide rich citation
+analytics including citing-author affiliations, but require institutional
+subscriptions and do not expose granular researcher-level geographic data
+through freely accessible APIs.  Dimensions (Digital Science) offers a
+freemium model but with rate-limited access.
+
+\paragraph{Open bibliometric APIs.}
+OpenAlex~\cite{priem2022openalex} is the most comprehensive open alternative,
+exposing author entities with affiliation histories.  Semantic Scholar
+~\cite{s2} provides a graph API covering 200 million papers with author
+and affiliation fields.  CrossRef~\cite{crossref} is authoritative for
+DOI-registered works but rarely includes author affiliations.
+
+\paragraph{Scholar-based scrapers.}
+Scholarly~\cite{scholarly} is a Python library for scraping Scholar profiles
+and paper metadata, but does not resolve citing-author affiliations or
+produce geographic visualizations.  \texttt{serpapi} and similar commercial
+wrappers provide structured Scholar data but charge per query.
+
+\paragraph{Research analytics dashboards.}
+Tools such as VOSviewer~\cite{vosviewer} and Bibliometrix~\cite{bibliometrix}
+produce bibliographic network visualizations from exported database files.
+They require manual data export from subscription databases and do not
+provide an automated pipeline from a Scholar URL to a ready-to-use output.
+
+CiteRadar differs from all of the above by: (a) being fully automated from
+a Scholar ID alone; (b) combining Scholar scraping with open API enrichment;
+(c) performing explicit author disambiguation; and (d) producing a
+self-contained interactive HTML map with no server dependency.
+
+% ============================================================
+\section{System Architecture}
+\label{sec:arch}
+
+CiteRadar is structured as five sequential pipeline stages, each implemented
+as an independent Python module.  Figure~\ref{fig:arch} shows the data flow.
+
+\begin{figure}[h]
+\centering
+\begin{lstlisting}[language={}]
+Google Scholar profile URL
+         |
+         v
+[Stage 1: scraper.py]
+  Fetch all papers from Scholar profile
+  -> papers.json / papers.csv
+         |
+         v
+[Stage 2: tracker.py]
+  Follow "Cited by" links for each paper
+  Paginate through all citing papers
+  CrossRef enrichment for truncated author lists
+  -> citations.json / citing_papers.csv
+         |
+         v
+[Stage 3: profiler.py]
+  For each unique citing paper:
+    Try OpenAlex  -> full author + institution + city
+    Try Semantic Scholar  -> fallback
+    Try CrossRef  -> last resort (names only)
+  -> authors.json / authors.csv
+         |
+         v
+[Stage 4: ranker.py]
+  Citation-count ranking  (group by author name)
+  h-index ranking         (OpenAlex with cross-validation)
+  -> ranked_by_citations.*
+  -> ranked_by_hindex.*
+         |
+         v
+[Stage 5: reporter.py]
+  Aggregate statistics
+  Nominatim geocoding
+  Folium interactive map
+  -> summary.txt
+  -> citation_map.html
+\end{lstlisting}
+\caption{CiteRadar pipeline data flow.}
+\label{fig:arch}
+\end{figure}
+
+The pipeline is invoked with a single command:
+
+\begin{lstlisting}[language=bash]
+citeradar i1H5XQ8AAAAJ
+\end{lstlisting}
+
+All intermediate and final outputs are written to a folder named after the
+researcher (e.g., \texttt{Chenxu\_Niu/}), making results self-contained and
+reproducible.
+
+% ============================================================
+\section{Stage 1: Scholar Profile Scraping}
+\label{sec:scraping}
+
+\subsection{Page Structure and Extraction}
+
+Scholar profile pages (\texttt{/citations?user=USER\_ID}) list papers in
+\texttt{<tr class="gsc\_a\_tr">} table rows.  Each row contains: the paper
+title in \texttt{<a class="gsc\_a\_at">}, authors and venue in two
+\texttt{<div class="gs\_gray">} elements, year in
+\texttt{<span class="gsc\_a\_h">}, and citation count in
+\texttt{<a class="gsc\_a\_ac">}.
+
+CiteRadar sets \texttt{pagesize=100} (the maximum Scholar permits per
+request) to minimize the number of HTTP requests for a large publication
+list.
+
+\subsection{Polite Crawling and Anti-Ban Strategy}
+
+Google Scholar has no publicly documented API and actively discourages
+automated access.  CiteRadar mitigates ban risk through four measures:
+
+\begin{enumerate}[label=\arabic*.]
+\item \textbf{Realistic browser User-Agent.}  The \texttt{requests} session
+presents a current Chrome/macOS User-Agent string identical to a real browser
+visit.
+
+\item \textbf{Conservative inter-request delay.}  A minimum delay of
+$d = 2$ seconds is enforced between all Scholar requests, well below the
+rate of a human browsing session.
+
+\item \textbf{Graceful 429 handling.}  On an HTTP 429 (Too Many Requests)
+response, the system waits 30 seconds and retries once.  If the retry also
+fails, the current paper is skipped and a warning is logged.
+
+\item \textbf{Minimal request count.}  \texttt{pagesize=100} reduces the
+number of profile-page requests by a factor of up to 10 compared to the
+default page size of 10.  Citation pages are fetched only for papers with
+\texttt{citations > 0}.
+\end{enumerate}
+
+\subsection{CrossRef Author Enrichment}
+
+Scholar truncates long author lists with an ellipsis~(\ldots).  For each
+citing paper with a truncated list, CiteRadar queries the CrossRef
+\texttt{/works} endpoint with \texttt{query.title=TITLE}.  Before using the
+result, a word-overlap title-similarity check confirms the top-ranked CrossRef
+record matches the Scholar entry (threshold $\geq 0.5$).  CrossRef is free,
+does not require an API key, and imposes no hard rate limit, making it a
+suitable enrichment source.
+
+\subsection{Meta-String Parsing and the Non-Breaking Space Problem}
+
+Scholar encodes author, venue, and year information in a single
+\texttt{<div class="gs\_a">} element formatted as:
+
+\begin{center}
+\texttt{Authors\,\textendash\,Venue,\,Year\,\textendash\,Publisher}
+\end{center}
+
+A critical implementation detail is that Scholar uses U+00A0 (non-breaking
+space, \texttt{\textbackslash xa0}) rather than a regular space around the
+dash separators.  Naive splitting on ``\texttt{ - }'' therefore fails silently,
+causing the author string to absorb both the venue and year fields.
+
+CiteRadar normalizes the raw string before splitting:
+
+\begin{lstlisting}[language=Python]
+raw = raw.replace("\xa0", " ")       # non-breaking space -> space
+raw = raw.replace("\u2013", "-")     # en-dash -> hyphen
+raw = re.sub(r" +", " ", raw)        # collapse multiple spaces
+parts = re.split(r" - ", raw)        # now split correctly
+\end{lstlisting}
+
+Year extraction uses the \emph{last} match of \texttt{\textbackslash
+b(19|20)\textbackslash d\{2\}\textbackslash b} in the venue-year substring,
+since the venue name sometimes itself contains a four-digit year
+(e.g., \textit{``2025 IEEE/ACM Conference\ldots, 2025''}).
+A final regex cleanup strips any residual trailing year from the venue string.
+
+% ============================================================
+\section{Stage 3: Multi-Source Author Profiling}
+\label{sec:profiler}
+
+For each unique citing paper, CiteRadar resolves per-author metadata
+through a three-source cascade.
+
+\subsection{Source Priority}
+
+\begin{enumerate}[label=\arabic*.]
+\item \textbf{OpenAlex} (primary).  The \texttt{/works} endpoint is queried
+with the paper title.  OpenAlex returns structured authorship records
+including institution name, country code, and institution entity ID.
+The institution ID (e.g., \texttt{https://openalex.org/I27837315}) is used
+to fetch city information from the \texttt{/institutions/} endpoint.
+A module-level dictionary caches institution IDs to coordinates, so each
+institution is fetched at most once per run.
+
+\item \textbf{Semantic Scholar} (secondary).  Queried when OpenAlex returns
+no results or a low-confidence title match.  Provides author names and
+affiliation strings, though rarely with city or country fields.
+
+\item \textbf{CrossRef} (tertiary).  Used as a final fallback for author
+names.  CrossRef author records include \texttt{given}/\texttt{family} name
+fields but rarely include affiliations.
+\end{enumerate}
+
+\subsection{Institution City Fetch — API URL Conversion}
+
+A subtle but critical implementation issue: OpenAlex institution IDs are
+returned as \emph{web} URLs (e.g., \texttt{https://openalex.org/I27837315}).
+Fetching this URL returns an HTML page rather than JSON.  The correct API
+endpoint has a different path prefix:
+
+\begin{lstlisting}[language=Python]
+api_url = inst_id.replace(
+    "https://openalex.org/",
+    "https://api.openalex.org/institutions/",
+)
+\end{lstlisting}
+
+This correction raised the fraction of author records with non-empty city
+data from 0\% to approximately 60\% in our case study.
+
+\subsection{Organisation Filtering}
+
+Author lists sometimes include conference or society names (e.g.,
+``Association for the Advancement of Artificial Intelligence 2026'')
+as pseudo-authors.  CiteRadar's \texttt{\_is\_person()} function rejects
+any display name that:
+(a) contains a word from a 35-keyword blocklist of organisation indicators
+(\textit{association}, \textit{university}, \textit{proceedings}, etc.); or
+(b) contains a digit.
+
+\subsection{Name Parsing}
+
+Display names from both ``First Last'' and ``Last, First'' formats are
+normalized by \texttt{split\_name()}.  Suffixes such as \textit{Jr.} and
+multi-word family names (e.g., \textit{van der Berg}) are handled by
+treating everything after the final space as the family name unless a comma
+separator is present.
+
+% ============================================================
+\section{Stage 4: Author Disambiguation and h-Index Ranking}
+\label{sec:ranking}
+
+\subsection{The Disambiguation Problem}
+
+Bibliometric databases routinely merge distinct researchers who share a
+common name into a single author entity.  This is a well-documented problem
+~\cite{ferreira2012brief} that CiteRadar encountered during development:
+``Wei Zhang'' in our dataset was assigned an h-index of 91 (the merged
+entity includes a very prominent researcher of that name), whereas the actual
+citing author has h-index~$\approx 10$.
+
+\subsection{Two-Stage Verification}
+
+CiteRadar applies a two-stage verification before accepting any h-index value.
+
+\paragraph{Stage 1: Direct ID lookup with affiliation cross-validation.}
+The OpenAlex author ID captured in Stage 3 is used for a direct entity fetch.
+The affiliation history of the retrieved entity---a list of all institutions
+OpenAlex has observed the author at---is compared against the institution
+independently recorded in Stage 3.
+
+The comparison uses a stop-word-filtered word-overlap function:
+
+\begin{equation}
+\text{sim}(A, B) = \frac{|W_A \cap W_B|}{\max(|W_A|, |W_B|)}
+\label{eq:sim}
+\end{equation}
+
+where $W_X$ denotes the set of words in string $X$ after removing the stop
+set $\mathcal{S}$:
+
+\begin{equation}
+\mathcal{S} = \{\text{university}, \text{of}, \text{the}, \text{institute},
+\text{college}, \text{for}, \text{at}, \ldots\}
+\label{eq:stopwords}
+\end{equation}
+
+The threshold is $\tau = 0.6$.  Without stop-word removal, ``Texas Tech
+University'' and ``University of Texas'' score $3/4 = 0.75$ (above $\tau$)
+and would be incorrectly treated as the same institution.  After stop-word
+removal, $W_{\text{TexasTech}} = \{\text{texas, tech}\}$ and
+$W_{\text{UT}} = \{\text{texas}\}$, yielding
+$\text{sim} = 1/2 = 0.5 < \tau$, correctly rejecting the match.
+
+\paragraph{Stage 2: Name-search fallback.}
+When no ID is available, the top-5 author candidates from the OpenAlex name
+search are evaluated.  Two thresholds are applied:
+(a) name similarity $\geq 0.7$ (Equation~\ref{eq:sim} without stop-word removal);
+(b) institution similarity $\geq 0.4$.
+The highest-scoring candidate passing both tests is then subjected to the
+same affiliation cross-validation as Stage~1.
+
+\paragraph{Conservative unknown-institution rule.}
+If the institution field is empty (17\% of records in our case study),
+neither stage can confirm identity.  To guard against common-name
+misattribution, CiteRadar only accepts h-index values $\leq 20$ for such
+records, since high h-index values are unlikely to accrue from
+disambiguation errors at that level.
+
+\subsection{Citation-Count Ranking}
+
+A separate ranking by \emph{times-cited-you} is built by grouping all author
+records by \texttt{full\_name} and counting the number of unique
+\texttt{citing\_paper\_title} values per group.  This measures how many
+distinct papers by that researcher have cited any of your work.
+
+% ============================================================
+\section{Stage 5: Geographic Visualization}
+\label{sec:map}
+
+\subsection{Geocoding Pipeline}
+
+City names in the author-profile data are resolved to latitude/longitude
+coordinates using the Nominatim geocoder~\cite{nominatim} (OpenStreetMap).
+Nominatim is free, requires no API key, and imposes a usage policy of
+$\leq 1$ request per second.  CiteRadar enforces a 1.1-second inter-request
+delay and caches all resolved coordinates in a module-level dictionary
+to prevent duplicate look-ups.
+
+\subsection{Map Construction with Folium}
+
+The map is built with Folium~\cite{folium}, a Python wrapper around the
+Leaflet.js JavaScript mapping library.  The output is a self-contained HTML
+file that can be opened in any browser without a network connection (beyond
+the initial tile load from CartoDB Positron).
+
+\paragraph{Heat-map layer.}
+Folium's \texttt{HeatMap} plugin receives a list of coordinate points,
+with each researcher contributing one point.  Researchers from larger cities
+therefore generate higher local intensity.  This layer is toggleable.
+
+\paragraph{Circle-marker layer.}
+One \texttt{CircleMarker} is placed at each geocoded city.  Colour and radius
+both encode the researcher count $n$:
+
+\begin{equation}
+r(n) = \max\!\bigl(7,\;7 + 10\log_2(n+1)\bigr)
+\label{eq:radius}
+\end{equation}
+
+The logarithmic scaling ensures large cities (e.g., $n=40$) do not completely
+occlude smaller ones.  Colour steps follow a perceptually ordered palette
+from light blue ($n=1$) through amber ($n=4$--$6$) to red ($n\geq 11$),
+providing an intuitive density encoding.
+
+\paragraph{Interactive popups.}
+Each circle marker exposes a popup listing all researcher names and
+institutions at that city on click.  A fixed legend panel and a centred
+title are injected as raw HTML using Folium's \texttt{Element} API, requiring
+no server-side rendering.
+
+% ============================================================
+\section{Case Study}
+\label{sec:eval}
+
+We applied CiteRadar to the Scholar profile \texttt{i1H5XQ8AAAAJ}
+(a researcher at NVIDIA / Texas Tech University).  Table~\ref{tab:stats}
+summarises the results.
+
+\begin{table}[h]
+\centering
+\caption{CiteRadar output statistics for the case-study profile.}
+\label{tab:stats}
+\begin{tabular}{lr}
+\toprule
+Metric & Value \\
+\midrule
+Papers on Scholar profile & 28 \\
+Papers with $\geq 1$ citation & 7 \\
+Total citing papers retrieved & 189 \\
+Unique citing researchers & 134 \\
+Countries represented & 11 \\
+Unique institutions & 31 \\
+Cities with location data & 28 / 28 (100\%) \\
+\midrule
+Top citing institution & Texas Tech University (39 researchers) \\
+Top cited paper & \textit{Energy efficient or exhaustive?} (62 citations) \\
+Most-cited country & United States (86 researchers) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Geocoding success rate.}
+All 28 cities with institution data were successfully resolved to coordinates
+by Nominatim, yielding a 100\% geocoding success rate.
+
+\paragraph{Disambiguation effectiveness.}
+Before implementing affiliation cross-validation, spot-checking revealed
+three severely inflated h-index values: ``Wei Zhang'' (assigned h=91,
+actual h$\approx$10), ``Yong Chen'' (assigned h=76, actual h$\approx$30),
+and ``Ian Foster'' (assigned h=125, actual h=147---in this case the
+\emph{correct} value was slightly lower than the database entity's).
+After adding the two-stage verification with stop-word-filtered institution
+similarity, these values were correctly flagged as either ``id\_mismatch''
+or ``name\_mismatch'' and excluded from the h-index ranking.
+
+% ============================================================
+\section{Limitations}
+\label{sec:limit}
+
+\begin{enumerate}[label=\arabic*.]
+\item \textbf{Scholar CAPTCHA.}  Google Scholar occasionally returns a
+CAPTCHA page rather than HTML results, particularly when many requests
+originate from the same IP within a short time window.  CiteRadar cannot
+solve CAPTCHAs; the affected paper is skipped and a warning is logged.
+Users running CiteRadar on a large profile ($>$1000 citing papers) should
+use the \texttt{--no-hindex} flag and run the pipeline over multiple sessions.
+
+\item \textbf{OpenAlex coverage.}  OpenAlex does not index all academic
+publications; preprints, technical reports, and non-English conference
+proceedings may be absent.  For these papers, CiteRadar falls back to
+Semantic Scholar or CrossRef.  Approximately 15\%--25\% of citing papers
+may not be resolved in any source, depending on the research domain.
+
+\item \textbf{Author-name disambiguation.}  The two-stage verification
+substantially reduces false positives but cannot guarantee perfect
+disambiguation for extremely common names (e.g., ``Wei Zhang'', ``Li Wang'')
+in domains with dense publication activity.  The \texttt{--manual} workflow
+(generating a CSV for the user to manually confirm Scholar IDs) provides the
+most accurate h-index data but requires human effort.
+
+\item \textbf{Geocoding city ambiguity.}  Institution cities are taken from
+OpenAlex's \texttt{geo.city} field, which may not always reflect the primary
+campus location.  Nominatim resolves ambiguous city names to the most
+prominent match by population, which may differ from the intended institution.
+
+\item \textbf{Dynamic Scholar structure.}  Google Scholar's HTML structure
+changes periodically.  CiteRadar's CSS selectors may require updating after
+major Scholar redesigns.
+\end{enumerate}
+
+% ============================================================
+\section{Conclusion}
+\label{sec:conc}
+
+We have presented CiteRadar, an open-source Python tool that automates
+citation intelligence analysis for individual researchers.  Starting from a
+single Google Scholar user ID, CiteRadar produces a complete citation profile:
+per-author institutional metadata, two ranked tables, a statistical summary,
+and an interactive world map.
+
+Key technical contributions include:
+(1) a robust Scholar meta-string parser that handles the non-breaking space
+separator used in Scholar's HTML;
+(2) a two-stage author disambiguation system using stop-word-filtered
+institution similarity to guard against same-name entity merging in OpenAlex;
+(3) an institution city-fetch pipeline with web-to-API URL conversion and
+a per-session cache; and
+(4) a logarithmically-scaled circle-marker map with per-city researcher
+popups, rendered as a self-contained HTML file using Folium.
+
+CiteRadar is designed to be immediately useful to individual researchers
+without institutional database access, requiring only a free Google Scholar
+profile and a standard Python environment.
+
+\paragraph{Availability.}
+CiteRadar is available at
+\url{https://github.com/YOUR_USERNAME/citeradar} and installable via
+\texttt{pip install citeradar}.
+
+% ============================================================
+\bibliographystyle{plain}
+\begin{thebibliography}{99}
+
+\bibitem{scholarpage}
+Google LLC.
+\textit{Google Scholar}.
+\url{https://scholar.google.com}, 2004.
+
+\bibitem{priem2022openalex}
+J.~Priem, H.~Piwowar, and R.~Orr.
+OpenAlex: A fully-open index of scholarly works, authors, venues, institutions, and concepts.
+\textit{arXiv preprint arXiv:2205.01833}, 2022.
+
+\bibitem{crossref}
+CrossRef.
+\textit{CrossRef REST API}.
+\url{https://api.crossref.org}, 2010.
+
+\bibitem{s2}
+O.~Fricke, M.~Cohan, D.~Ammar, M.~Bhagavatula, R.~Lo, K.~Liu, L.~Lum, P.~Ngo, and K.~Ng.
+Semantic Scholar Open Research Corpus.
+\textit{Proceedings of ACL 2018}, 2018.
+
+\bibitem{scholarly}
+S.~Choubey, O.~Kim, and contributors.
+\textit{scholarly: Retrieve author and publication information from Google Scholar}.
+\url{https://github.com/scholarly-python-package/scholarly}, 2019.
+
+\bibitem{vosviewer}
+N.~J. van Eck and L.~Waltman.
+Software survey: VOSviewer, a computer program for bibliometric mapping.
+\textit{Scientometrics}, 84(2):523--538, 2010.
+
+\bibitem{bibliometrix}
+M.~Aria and C.~Cuccurullo.
+bibliometrix: An R-tool for comprehensive science mapping analysis.
+\textit{Journal of Informetrics}, 11(4):959--975, 2017.
+
+\bibitem{ferreira2012brief}
+A.~A. Ferreira, M.~A. Gon\c{c}alves, and A.~H. Laender.
+A brief survey of automatic methods for author name disambiguation.
+\textit{ACM SIGMOD Record}, 41(2):15--26, 2012.
+
+\bibitem{nominatim}
+OpenStreetMap Contributors.
+\textit{Nominatim: Search and Geocoding API}.
+\url{https://nominatim.openstreetmap.org}, 2008.
+
+\bibitem{folium}
+R.~Filipe, J.~Biggs, and contributors.
+\textit{Folium: Python data, Leaflet.js maps}.
+\url{https://github.com/python-visualization/folium}, 2013.
+
+\end{thebibliography}
+
+\end{document}

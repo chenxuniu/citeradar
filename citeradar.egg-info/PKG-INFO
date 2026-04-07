@@ -1,0 +1,244 @@
+Metadata-Version: 2.4
+Name: citeradar
+Version: 1.0.0
+Summary: Automated citation intelligence for Google Scholar profiles — author profiles, rankings, and interactive world map.
+Author: CiteRadar Contributors
+License: MIT
+Project-URL: Homepage, https://github.com/YOUR_USERNAME/citeradar
+Project-URL: Issues, https://github.com/YOUR_USERNAME/citeradar/issues
+Keywords: citation,google-scholar,bibliometrics,research,visualization
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Classifier: Topic :: Scientific/Engineering :: Information Analysis
+Classifier: Topic :: Internet :: WWW/HTTP :: Indexing/Search
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: requests>=2.31
+Requires-Dist: beautifulsoup4>=4.12
+Requires-Dist: folium>=0.15
+Requires-Dist: geopy>=2.4
+Requires-Dist: lxml>=4.9
+Dynamic: license-file
+
+# CiteRadar
+
+> **Automated citation intelligence for Google Scholar profiles.**
+> Give CiteRadar a Scholar user ID and receive a complete citation analysis:
+> full author profiles, two ranked lists, a statistics summary, and an
+> interactive world map — all in one command.
+
+---
+
+## Quick Start
+
+```bash
+pip install citeradar
+citeradar i1H5XQ8AAAAJ
+```
+
+A folder named after the researcher is created in the current directory:
+
+```
+Chenxu_Niu/
+├── summary.txt               # statistics overview
+├── papers.csv                # researcher's own papers + citation counts
+├── citing_papers.csv         # every paper that cited them, with author info
+├── ranked_by_citations.csv   # who cited you most
+├── ranked_by_citations.json
+├── ranked_by_hindex.csv      # most influential researchers who cited you
+├── ranked_by_hindex.json
+└── citation_map.html         # interactive world map — open in any browser
+```
+
+---
+
+## Installation
+
+### From PyPI (recommended)
+
+```bash
+pip install citeradar
+```
+
+### From source
+
+```bash
+git clone https://github.com/YOUR_USERNAME/citeradar.git
+cd citeradar
+pip install -e .
+```
+
+### Dependencies
+
+| Package | Purpose |
+|---------|---------|
+| `requests` | HTTP client for Scholar, OpenAlex, CrossRef, Semantic Scholar |
+| `beautifulsoup4` + `lxml` | HTML parsing for Scholar pages |
+| `folium` | Interactive Leaflet.js maps |
+| `geopy` | Nominatim geocoding (city → lat/lng) |
+
+---
+
+## Usage
+
+```
+citeradar <SCHOLAR_USER_ID> [options]
+```
+
+### Options
+
+| Flag | Description |
+|------|-------------|
+| `--no-enrich` | Skip CrossRef author enrichment (faster) |
+| `--no-hindex` | Skip OpenAlex h-index look-up (much faster) |
+| `--outdir DIR` | Parent directory for the output folder (default: `.`) |
+
+### Examples
+
+```bash
+# Full pipeline (all five stages)
+citeradar i1H5XQ8AAAAJ
+
+# Fast mode — citation ranking only, no h-index look-ups
+citeradar i1H5XQ8AAAAJ --no-hindex
+
+# Write output to a specific directory
+citeradar i1H5XQ8AAAAJ --outdir ~/research/citations
+```
+
+You can also run CiteRadar as a module:
+
+```bash
+python -m citeradar i1H5XQ8AAAAJ
+```
+
+---
+
+## Pipeline Stages
+
+```
+Stage 1 — scraper
+  Google Scholar profile page
+  → papers.csv / papers.json
+
+Stage 2 — tracker
+  Scholar "Cited by" pages for each paper
+  + CrossRef (author list enrichment)
+  → citing_papers.csv / citations.json
+
+Stage 3 — profiler
+  OpenAlex  (primary: institution, city, country, author ID)
+  Semantic Scholar  (fallback)
+  CrossRef          (fallback)
+  → authors.csv / authors.json
+
+Stage 4 — ranker
+  Citation-count ranking  (groups by author, counts unique citing papers)
+  h-index ranking         (OpenAlex with affiliation cross-validation)
+  → ranked_by_citations.*
+  → ranked_by_hindex.*
+
+Stage 5 — reporter
+  Statistics summary
+  Nominatim geocoding (city → lat/lng, cached, 1 req/s)
+  Folium interactive map (heat layer + circle markers)
+  → summary.txt
+  → citation_map.html
+```
+
+---
+
+## Author Disambiguation
+
+Bibliometric databases sometimes *merge* different researchers who share the
+same name into a single entity, leading to wildly inflated h-index values.
+CiteRadar applies a two-stage verification before accepting any h-index:
+
+1. **Direct ID lookup + affiliation cross-validation**
+   The OpenAlex author ID (captured during Stage 3) is used for a direct
+   entity fetch.  The affiliation history of the retrieved entity is then
+   compared to the institution we independently recorded, using
+   stop-word-filtered word overlap (threshold ≥ 0.6).  Stop words such as
+   *university*, *of*, *the*, *institute* are removed before comparison,
+   so that "Texas Tech University" and "University of Texas" are correctly
+   treated as *different* institutions (overlap = 0.5, below threshold).
+
+2. **Name-search fallback with double-check**
+   If no ID is available, the top-5 name-search candidates are evaluated.
+   Both name similarity (≥ 0.7) and institution similarity (≥ 0.4) must be
+   satisfied before the best candidate is accepted, followed by the same
+   affiliation cross-validation.
+
+If the institution field is unknown, only h-index values ≤ 20 are accepted
+to guard against common-name mis-attribution.
+
+---
+
+## Rate Limits and Anti-Ban Measures
+
+| Source | Strategy |
+|--------|----------|
+| Google Scholar | Realistic browser User-Agent; 2 s between requests; 30 s back-off on HTTP 429 |
+| OpenAlex | `mailto=` polite-pool parameter; 1 s between requests; 20 s back-off on 429 |
+| CrossRef | `User-Agent` with contact e-mail; used only for truncated author lists |
+| Nominatim | 1.1 s between requests (Nominatim usage policy: ≤ 1 req/s) |
+
+---
+
+## Output File Reference
+
+### `papers.csv`
+
+| Field | Description |
+|-------|-------------|
+| `title` | Paper title |
+| `authors` | Author list as displayed on Scholar |
+| `venue` | Journal or conference |
+| `year` | Publication year |
+| `citations` | Citation count shown on Scholar |
+| `paper_url` | Link to Scholar detail page |
+
+### `citing_papers.csv`
+
+| Field | Description |
+|-------|-------------|
+| `cited_paper_title` | Which of your papers was cited |
+| `title` | Title of the citing paper |
+| `authors` | Author list (CrossRef-enriched when available) |
+| `authors_complete` | `True` if author list is confirmed complete |
+| `venue` | Journal or conference |
+| `year` | Year |
+| `citing_url` | Scholar link |
+
+### `ranked_by_citations.csv`
+
+| Field | Description |
+|-------|-------------|
+| `rank` | Rank by number of citations |
+| `full_name` | Author name |
+| `institution` / `city` / `country` | Affiliation metadata |
+| `times_cited_you` | Number of their papers that cite you |
+| `your_papers_cited` | Which of your papers they cited |
+| `openalex_author_id` | OpenAlex entity URL |
+
+### `ranked_by_hindex.csv`
+
+All fields from `ranked_by_citations.csv` plus:
+
+| Field | Description |
+|-------|-------------|
+| `h_index` | Verified h-index from OpenAlex |
+| `total_papers` | Total works count on OpenAlex |
+| `total_citations` | Total citation count on OpenAlex |
+| `openalex_id` | `id_mismatch` or `name_mismatch` if disambiguation failed |
+
+---
+
+## License
+
+MIT License — see [LICENSE](LICENSE).

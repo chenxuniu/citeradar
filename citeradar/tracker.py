@@ -1,0 +1,356 @@
+"""
+tracker.py — Citation Tracker
+
+For every paper in ``papers.json`` that has at least one citation, visits
+the Google Scholar "Cited by" page and retrieves all citing papers.
+
+Anti-ban strategy
+-----------------
+- Uses a realistic browser User-Agent header.
+- Enforces a 2-second minimum delay between Scholar requests.
+- On HTTP 429, backs off for 30 seconds and retries once.
+- Optionally enriches truncated author lists via the CrossRef API (free,
+  no key required) to minimise the number of Scholar page requests.
+
+Non-breaking-space fix
+----------------------
+Scholar's ``<div class="gs_a">`` sometimes uses U+00A0 (non-breaking space)
+around the " – " separators.  ``parse_meta()`` normalises all whitespace
+variants before splitting, ensuring correct venue/year extraction.
+"""
+
+import json
+import time
+import csv
+import re
+from dataclasses import dataclass, asdict
+from typing import Optional
+import requests
+from bs4 import BeautifulSoup
+
+
+# ---------------------------------------------------------------------------
+# Data model
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CitingPaper:
+    cited_paper_title: str    # which of YOUR papers was cited
+    title: str                # title of the citing paper
+    authors: str              # full author list (enriched via CrossRef if available)
+    authors_complete: bool    # True if author list is confirmed complete
+    venue: str                # journal or conference
+    year: str
+    citing_url: str           # link to the citing paper on Scholar
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+BASE_URL       = "https://scholar.google.com"
+CROSSREF_URL   = "https://api.crossref.org/works"
+DELAY_SECONDS  = 2
+
+
+# ---------------------------------------------------------------------------
+# HTTP helpers
+# ---------------------------------------------------------------------------
+
+def _get_soup(url: str, session: requests.Session) -> Optional[BeautifulSoup]:
+    """GET a URL and return parsed HTML, with one 429-retry."""
+    resp = session.get(url, headers=HEADERS, timeout=15)
+    if resp.status_code == 429:
+        print("    [!] Rate-limited (HTTP 429) — waiting 30 s…")
+        time.sleep(30)
+        resp = session.get(url, headers=HEADERS, timeout=15)
+    if resp.status_code != 200:
+        print(f"    [!] HTTP {resp.status_code} for {url}")
+        return None
+    return BeautifulSoup(resp.text, "html.parser")
+
+
+# ---------------------------------------------------------------------------
+# Meta-string parser
+# ---------------------------------------------------------------------------
+
+def parse_meta(raw: str) -> tuple[str, str, str]:
+    """
+    Split the Scholar ``gs_a`` meta string into ``(authors, venue, year)``.
+
+    Scholar formats this field as::
+
+        Authors - Venue, Year - Publisher
+
+    but uses U+00A0 (non-breaking space) around the dash separators, so we
+    normalise all whitespace before splitting.
+    """
+    raw = raw.replace("\xa0", " ").replace("\u2013", "-").replace("\u2014", "-")
+    raw = re.sub(r" +", " ", raw).strip()
+
+    parts   = re.split(r" - ", raw)
+    authors = parts[0].strip() if parts else ""
+    year    = ""
+    venue   = ""
+
+    if len(parts) >= 2:
+        venue_year = parts[1].strip()
+        all_years  = list(re.finditer(r"\b(19|20)\d{2}\b", venue_year))
+        if all_years:
+            m     = all_years[-1]            # use the LAST year found
+            year  = m.group(0)
+            venue = venue_year[: m.start()].strip().rstrip(",").strip()
+            if not venue:
+                venue = venue_year[m.end():].strip().lstrip(",").strip()
+        else:
+            venue = venue_year
+
+    if not year:
+        for part in parts[2:]:
+            m = re.search(r"\b(19|20)\d{2}\b", part)
+            if m:
+                year = m.group(0)
+                break
+
+    venue = re.sub(r",?\s*\b(19|20)\d{2}\b\s*$", "", venue).strip()
+    venue = re.sub(r"[,\s]+$", "", venue).strip()
+
+    return authors, venue, year
+
+
+# ---------------------------------------------------------------------------
+# CrossRef author enrichment
+# ---------------------------------------------------------------------------
+
+def _title_similar(a: str, b: str) -> bool:
+    """Return True if two title strings share ≥50 % of their words."""
+    wa = set(re.findall(r"\w+", a.lower()))
+    wb = set(re.findall(r"\w+", b.lower()))
+    if not wa or not wb:
+        return False
+    return len(wa & wb) / max(len(wa), len(wb)) >= 0.5
+
+
+def _crossref_full_authors(title: str, session: requests.Session) -> Optional[str]:
+    """
+    Query CrossRef to get the complete author list for a paper.
+    Returns a formatted ``"First Last, First Last, …"`` string, or ``None``.
+    CrossRef is free and does not require an API key.
+    """
+    try:
+        resp = session.get(
+            CROSSREF_URL,
+            params={"query.title": title, "rows": 1},
+            headers={"User-Agent": "CiteRadar/1.0 (mailto:citeradar@example.com)"},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return None
+        items = resp.json().get("message", {}).get("items", [])
+        if not items:
+            return None
+        item     = items[0]
+        cr_title = " ".join(item.get("title", [""])).lower()
+        if not _title_similar(title.lower(), cr_title):
+            return None
+        authors = item.get("author", [])
+        if not authors:
+            return None
+        parts = []
+        for a in authors:
+            given  = a.get("given",  "").strip()
+            family = a.get("family", "").strip()
+            name   = f"{given} {family}".strip() if given else family
+            if name:
+                parts.append(name)
+        return ", ".join(parts) if parts else None
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Page parsers
+# ---------------------------------------------------------------------------
+
+def _get_cited_by_url(paper_url: str, session: requests.Session) -> Optional[str]:
+    """Return the 'Cited by' search URL for a paper's Scholar detail page."""
+    soup = _get_soup(paper_url, session)
+    if soup is None:
+        return None
+    for a in soup.find_all("a", href=True):
+        if a.get_text(strip=True).lower().startswith("cited by"):
+            href = a["href"]
+            return href if href.startswith("http") else BASE_URL + href
+    return None
+
+
+def _parse_citing_papers(soup: BeautifulSoup, cited_title: str,
+                          session: requests.Session, enrich: bool) -> list[CitingPaper]:
+    """Parse all result cards on a Scholar search-results page."""
+    results = []
+    for div in soup.select("div.gs_r.gs_or"):
+        title_tag = div.select_one("h3.gs_rt a")
+        if title_tag:
+            title      = title_tag.get_text(strip=True)
+            href       = title_tag.get("href", "")
+            citing_url = href if href.startswith("http") else BASE_URL + href
+        else:
+            title_no_link = div.select_one("h3.gs_rt")
+            title         = title_no_link.get_text(strip=True) if title_no_link else ""
+            citing_url    = ""
+
+        title = re.sub(r"^\[.*?\]\s*", "", title)   # strip [PDF] [HTML] prefixes
+
+        meta_tag = div.select_one("div.gs_a")
+        raw_meta = meta_tag.get_text(separator=" ", strip=True) if meta_tag else ""
+        authors, venue, year = parse_meta(raw_meta)
+
+        authors_complete = "\u2026" not in authors and "..." not in authors
+        if enrich and not authors_complete and title:
+            full = _crossref_full_authors(title, session)
+            if full:
+                authors          = full
+                authors_complete = True
+
+        if title:
+            results.append(CitingPaper(
+                cited_paper_title=cited_title,
+                title=title,
+                authors=authors,
+                authors_complete=authors_complete,
+                venue=venue,
+                year=year,
+                citing_url=citing_url,
+            ))
+    return results
+
+
+def _has_next_page(soup: BeautifulSoup) -> bool:
+    """Return True if a 'Next' pagination link exists."""
+    if soup.select_one("td#gs_n a[aria-label='Next']"):
+        return True
+    nav = soup.select_one("td#gs_n")
+    if nav:
+        for a in nav.find_all("a"):
+            if "next" in a.get_text(strip=True).lower():
+                return True
+    if soup.select_one("button.gs_btnPR:not([disabled])"):
+        return True
+    return False
+
+
+def _fetch_all_citing(cited_title: str, cited_by_url: str,
+                      session: requests.Session, enrich: bool) -> list[CitingPaper]:
+    """Paginate through all citing papers for a single paper."""
+    all_citing: list[CitingPaper] = []
+    start = 0
+    while True:
+        soup = _get_soup(f"{cited_by_url}&start={start}", session)
+        if soup is None:
+            break
+        page = _parse_citing_papers(soup, cited_title, session, enrich)
+        all_citing.extend(page)
+        print(f"    [{start + 1}–{start + len(page)}] {len(page)} papers retrieved")
+        if not _has_next_page(soup):
+            break
+        start += 10
+        time.sleep(DELAY_SECONDS)
+    return all_citing
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def track_citations(papers_data: dict, enrich: bool = True) -> tuple[list[CitingPaper], list[dict]]:
+    """
+    For each paper in ``papers_data["papers"]`` that has citations, fetch all
+    citing papers from Google Scholar.
+
+    Parameters
+    ----------
+    papers_data : dict
+        The JSON object produced by :func:`scraper.scrape_profile`.
+    enrich : bool
+        If ``True``, resolve truncated Scholar author lists via CrossRef.
+
+    Returns
+    -------
+    all_citing : list[CitingPaper]
+    summary    : list[dict]
+        Per-paper retrieval statistics.
+    """
+    papers       = papers_data["papers"]
+    cited_papers = [p for p in papers if p["citations"] > 0]
+
+    print(f"Papers with citations: {len(cited_papers)} / {len(papers)}")
+    print(f"CrossRef author enrichment: {'enabled' if enrich else 'disabled'}\n")
+
+    session     = requests.Session()
+    all_citing: list[CitingPaper] = []
+    summary:    list[dict]        = []
+
+    for i, paper in enumerate(cited_papers, 1):
+        title       = paper["title"]
+        n_citations = paper["citations"]
+        print(f"[{i}/{len(cited_papers)}] {title}")
+        print(f"  Claimed citations: {n_citations}")
+
+        time.sleep(DELAY_SECONDS)
+        cited_by_url = _get_cited_by_url(paper["paper_url"], session)
+
+        if not cited_by_url:
+            print("  Could not find 'Cited by' link — skipping.\n")
+            continue
+
+        time.sleep(DELAY_SECONDS)
+        citing = _fetch_all_citing(title, cited_by_url, session, enrich)
+        all_citing.extend(citing)
+
+        print(f"  → {len(citing)} citing papers retrieved.\n")
+        summary.append({
+            "your_paper":          title,
+            "year":                paper["year"],
+            "venue":               paper["venue"],
+            "claimed_citations":   n_citations,
+            "retrieved_citations": len(citing),
+        })
+        time.sleep(DELAY_SECONDS)
+
+    return all_citing, summary
+
+
+def save_citations(author_name: str, all_citing: list[CitingPaper],
+                   summary: list[dict], json_path: str, csv_path: str) -> None:
+    """Persist citation data to JSON and CSV."""
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "author":               author_name,
+                "total_citing_papers":  len(all_citing),
+                "citations":            [asdict(c) for c in all_citing],
+            },
+            f, ensure_ascii=False, indent=2,
+        )
+
+    if all_citing:
+        fields = list(asdict(all_citing[0]).keys())
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(asdict(c) for c in all_citing)
+
+    print(f"\nCitations saved → {json_path}, {csv_path}")
+    print(f"\nRetrieval summary:")
+    for s in summary:
+        print(f"  [{s['claimed_citations']:>3} cited / "
+              f"{s['retrieved_citations']:>3} retrieved]  {s['your_paper']}")
