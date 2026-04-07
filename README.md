@@ -76,6 +76,9 @@ Chenxu_Niu/
 ```
 
 ### Interactive World Map (`citation_map.html`)
+
+![CiteRadar World Map](assets/citation_map_demo.png)
+
 - **Heat-map layer** — shows global citation density at a glance
 - **Circle markers** — one per city, sized and colored by researcher count
 - **Click any circle** — popup shows researcher names and institutions
