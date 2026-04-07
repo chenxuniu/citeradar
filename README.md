@@ -200,21 +200,6 @@ If an author's institution is unknown, only h-index ≤ 20 is accepted to preven
 
 ---
 
-## Comparison with Similar Tools
-
-| Feature | CiteRadar | CitationMap |
-|---------|-----------|-------------|
-| Installation | `pip install citeradar` | `pip install citation-map` |
-| Author profiles (name, institution, city, country) | ✅ | ✅ |
-| Ranked by citation frequency | ✅ | ❌ |
-| Ranked by h-index | ✅ | ❌ |
-| Author disambiguation guard | ✅ | ❌ |
-| Interactive world map | ✅ | ✅ |
-| Plain-text summary report | ✅ | ❌ |
-| Multiple data sources (OpenAlex + S2 + CrossRef) | ✅ | ❌ |
-| Output folder per researcher | ✅ | ❌ |
-
----
 
 ## Citation
 
