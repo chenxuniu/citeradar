@@ -222,7 +222,7 @@ If you use CiteRadar in your research, please cite:
   title   = {CiteRadar: Automated Citation Intelligence for Google Scholar Profiles},
   author  = {Niu, Chenxu},
   year    = {2025},
-  url     = {https://github.com/YOUR_USERNAME/citeradar},
+  url     = {https://github.com/chenxuniu/citeradar},
   note    = {PyPI: https://pypi.org/project/citeradar/}
 }
 ```
