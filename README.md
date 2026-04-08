@@ -2,7 +2,8 @@
 
 **Automated Citation Intelligence for Google Scholar Profiles**
 
-*CiteRadar: A Python tool to discover who cites your research, profile those researchers, rank them by influence, and visualize their global distribution on an interactive world map.*
+*CiteRadar: A Citation Intelligence Platform for Researcher
+Profiling and Geographic Visualization.* [[Paper]](https://openreview.net/pdf?id=15TusV5Bkh)
 
 [![PyPI version](https://badge.fury.io/py/citeradar.svg)](https://pypi.org/project/citeradar/)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
