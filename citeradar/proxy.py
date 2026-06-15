@@ -2,11 +2,25 @@
 
 import random
 from typing import Optional
+from urllib.parse import urlparse
 
 import requests
 import yaml
 
 _PROXY_SCHEMES = {"http", "https", "socks4", "socks4a", "socks5", "socks5h"}
+_MAX_FAILURES = 3
+_RETRYABLE_STATUSES = {403, 407, 408, 429}
+_SCHOLAR_BLOCK_MARKERS = (
+    "form[action*='/sorry/']",
+    "/sorry/",
+    "input name=\"captcha\"",
+    "input name='captcha'",
+    "g-recaptcha",
+    "gs_captcha_ccl",
+    "our systems have detected unusual traffic",
+    "not a robot",
+    "to continue, please type the characters",
+)
 
 
 class ProxyConfigError(ValueError):
@@ -55,12 +69,80 @@ class ProxyPool:
             raise ProxyConfigError("Proxy configuration must contain at least one group.")
         self.groups = groups
         self._index = 0
+        self._failures = {proxy_id: 0 for proxy_id, _ in groups}
+        self._disabled: set[str] = set()
 
     def next(self) -> dict[str, str]:
-        proxy_id, endpoints = self.groups[self._index]
-        self._index = (self._index + 1) % len(self.groups)
-        endpoint = random.choice(endpoints)
-        return dict(endpoint)
+        """Return the next active proxy endpoint."""
+        _, endpoint = self.next_proxy()
+        return endpoint
+
+    def next_proxy(self) -> tuple[str, dict[str, str]]:
+        """Return ``(proxy_id, endpoint)`` for the next active proxy."""
+        for _ in range(len(self.groups)):
+            proxy_id, endpoints = self.groups[self._index]
+            self._index = (self._index + 1) % len(self.groups)
+            if proxy_id in self._disabled:
+                continue
+            endpoint = random.choice(endpoints)
+            return proxy_id, dict(endpoint)
+        raise requests.exceptions.ProxyError("All configured proxies are unavailable.")
+
+    def mark_success(self, proxy_id: str) -> None:
+        self._failures[proxy_id] = 0
+
+    def mark_failure(self, proxy_id: str, reason: str) -> None:
+        if proxy_id in self._disabled:
+            return
+        failures = self._failures.get(proxy_id, 0) + 1
+        self._failures[proxy_id] = failures
+        if failures >= _MAX_FAILURES:
+            self._disabled.add(proxy_id)
+            print(f"    [proxy] {proxy_id} disabled after {failures} failures: {reason}")
+        else:
+            print(f"    [proxy] {proxy_id} failed ({failures}/{_MAX_FAILURES}): {reason}")
+
+    def all_disabled(self) -> bool:
+        return len(self._disabled) == len(self.groups)
+
+
+def _is_retryable_status(status_code: int) -> bool:
+    return status_code in _RETRYABLE_STATUSES or 500 <= status_code < 600
+
+
+def _is_scholar_url(url: str) -> bool:
+    try:
+        host = urlparse(url).netloc.lower()
+    except Exception:
+        return False
+    return host == "scholar.google.com" or host.endswith(".scholar.google.com")
+
+
+def _looks_like_scholar_block(url: str, resp: requests.Response) -> bool:
+    if not _is_scholar_url(resp.url or url):
+        return False
+    try:
+        text = resp.text.lower()
+    except Exception:
+        return False
+    return any(marker in text for marker in _SCHOLAR_BLOCK_MARKERS)
+
+
+def _failure_reason(url: str, resp: requests.Response) -> str:
+    if _looks_like_scholar_block(url, resp):
+        return "Google Scholar CAPTCHA/block page"
+    return f"HTTP {resp.status_code}"
+
+
+def _proxy_failed_response(url: str, resp: requests.Response) -> bool:
+    return _is_retryable_status(resp.status_code) or _looks_like_scholar_block(url, resp)
+
+
+def _all_proxies_error(last_failure: str) -> requests.exceptions.ProxyError:
+    message = "All configured proxies are unavailable."
+    if last_failure:
+        message += f" Last failure: {last_failure}"
+    return requests.exceptions.ProxyError(message)
 
 
 class RotatingProxySession(requests.Session):
@@ -71,9 +153,41 @@ class RotatingProxySession(requests.Session):
         self.proxy_pool = proxy_pool
 
     def request(self, method, url, **kwargs):
-        if kwargs.get("proxies") is None:
-            kwargs["proxies"] = self.proxy_pool.next()
-        return super().request(method, url, **kwargs)
+        if kwargs.get("proxies") is not None:
+            return super().request(method, url, **kwargs)
+
+        last_failure = ""
+        last_exception = None
+        while True:
+            try:
+                proxy_id, proxies = self.proxy_pool.next_proxy()
+            except requests.exceptions.ProxyError as e:
+                if last_exception:
+                    raise _all_proxies_error(last_failure) from last_exception
+                raise _all_proxies_error(last_failure) from e
+
+            request_kwargs = dict(kwargs)
+            request_kwargs["proxies"] = proxies
+            try:
+                resp = super().request(method, url, **request_kwargs)
+            except requests.RequestException as e:
+                last_failure = str(e)
+                last_exception = e
+                self.proxy_pool.mark_failure(proxy_id, last_failure)
+                if self.proxy_pool.all_disabled():
+                    raise _all_proxies_error(last_failure) from e
+                continue
+
+            if _proxy_failed_response(url, resp):
+                last_failure = _failure_reason(url, resp)
+                resp.close()
+                self.proxy_pool.mark_failure(proxy_id, last_failure)
+                if self.proxy_pool.all_disabled():
+                    raise _all_proxies_error(last_failure)
+                continue
+
+            self.proxy_pool.mark_success(proxy_id)
+            return resp
 
 
 def load_proxy_pool(path: str) -> ProxyPool:

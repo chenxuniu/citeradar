@@ -143,7 +143,9 @@ PROXY_ID_2:
 
 CiteRadar rotates across top-level proxy IDs for Requests-based calls
 (Google Scholar, CrossRef, OpenAlex, Semantic Scholar), and randomly chooses
-one local endpoint within each proxy ID. Nominatim geocoding is not proxied.
+one local endpoint within each proxy ID. Proxy IDs that repeatedly fail,
+hit retryable HTTP errors, or receive Scholar CAPTCHA/block pages are skipped
+for the current run. Nominatim geocoding is not proxied.
 
 You can also run it as a module:
 ```bash
