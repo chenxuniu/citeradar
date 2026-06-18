@@ -14,6 +14,8 @@ Usage
       --no-enrich   Skip CrossRef author enrichment (faster, fewer details)
       --no-hindex   Skip OpenAlex h-index look-up  (fastest, no rankings)
       --outdir DIR  Parent directory for the output folder (default: current dir)
+      --proxy-config PATH
+                    YAML file defining rotating Requests proxies
 
 Output folder structure
 -----------------------
@@ -35,13 +37,14 @@ import json
 import os
 import re
 import sys
-import requests
 
 from .scraper  import scrape_profile, save_papers
-from .tracker  import track_citations, save_citations
-from .profiler import build_author_profiles, save_author_profiles
+from .tracker  import track_citations
+from .profiler import build_author_profiles
 from .ranker   import run_rankings
 from .reporter import generate_report
+from .errors   import RateLimitError
+from .proxy    import ProxyConfigError, load_proxy_pool, make_session
 
 
 # ---------------------------------------------------------------------------
@@ -65,12 +68,51 @@ def _p(folder: str, filename: str) -> str:
     return os.path.join(folder, filename)
 
 
+def _load_json(path: str) -> dict:
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _find_existing_run(outdir: str, scholar_id: str) -> tuple[str, dict]:
+    """Find the newest completed papers.json for this Scholar ID."""
+    candidates: list[tuple[float, str, dict]] = []
+    paths = [os.path.join(outdir, "papers.json")]
+
+    if os.path.isdir(outdir):
+        for name in os.listdir(outdir):
+            paths.append(os.path.join(outdir, name, "papers.json"))
+
+    for papers_json in paths:
+        data = _load_json(papers_json)
+        if data.get("scholar_id") != scholar_id or not data.get("complete", True):
+            continue
+        try:
+            mtime = os.path.getmtime(papers_json)
+        except OSError:
+            continue
+        candidates.append((mtime, os.path.dirname(papers_json), data))
+
+    if not candidates:
+        return "", {}
+    _, folder, papers_data = max(candidates, key=lambda item: item[0])
+    return folder, papers_data
+
+
+def _is_complete(data: dict) -> bool:
+    """Older artifacts had no marker; treat them as complete."""
+    return bool(data) and data.get("complete", True)
+
+
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
 
 def run_pipeline(scholar_id: str, outdir: str,
-                 enrich: bool, compute_hindex: bool) -> None:
+                 enrich: bool, compute_hindex: bool,
+                 proxy_pool=None) -> None:
     """
     Execute the full CiteRadar pipeline for a single Scholar profile.
 
@@ -80,6 +122,7 @@ def run_pipeline(scholar_id: str, outdir: str,
     outdir         : parent directory; the researcher's sub-folder is created here
     enrich         : whether to call CrossRef to complete truncated author lists
     compute_hindex : whether to run the OpenAlex h-index look-up stage
+    proxy_pool     : optional rotating proxy pool for Requests-based calls
     """
 
     # ── Stage 1: scrape researcher's own papers ────────────────────────────
@@ -87,60 +130,92 @@ def run_pipeline(scholar_id: str, outdir: str,
     print("STAGE 1 — Scraping Google Scholar profile")
     print("=" * 60)
 
-    author_info, papers = scrape_profile(scholar_id)
-    if not papers:
-        print("[ERROR] No papers found.  The profile may be private or "
-              "Scholar returned a CAPTCHA.  Aborting.")
-        sys.exit(1)
+    folder, papers_data = _find_existing_run(outdir, scholar_id)
+    if folder:
+        author_info = papers_data.get("author", {})
+        author_name = author_info.get("name", scholar_id)
+        print(f"  Reusing completed papers.json from: {folder}")
+    else:
+        author_info, papers = scrape_profile(scholar_id, proxy_pool=proxy_pool)
+        if not papers:
+            print("[ERROR] No papers found.  The profile may be private or "
+                  "Scholar returned a CAPTCHA.  Aborting.")
+            sys.exit(1)
 
-    author_name = author_info.get("name", scholar_id)
-    folder      = os.path.join(outdir, _sanitise_name(author_name))
-    _ensure_dir(folder)
+        author_name = author_info.get("name", scholar_id)
+        folder      = os.path.join(outdir, _sanitise_name(author_name))
+        _ensure_dir(folder)
+        print(f"\nOutput folder: {folder}")
+
+        papers_json = _p(folder, "papers.json")
+        papers_csv  = _p(folder, "papers.csv")
+        save_papers(author_info, papers, papers_json, papers_csv, scholar_id)
+        papers_data = _load_json(papers_json)
+
     print(f"\nOutput folder: {folder}")
-
-    papers_json = _p(folder, "papers.json")
-    papers_csv  = _p(folder, "papers.csv")
-    save_papers(author_info, papers, papers_json, papers_csv)
 
     # ── Stage 2: track citations ──────────────────────────────────────────
     print("\n" + "=" * 60)
     print("STAGE 2 — Tracking citations on Google Scholar")
     print("=" * 60)
 
-    with open(papers_json, encoding="utf-8") as f:
-        papers_data = json.load(f)
-
-    all_citing, summary = track_citations(papers_data, enrich=enrich)
-    if not all_citing:
-        print("[WARN] No citing papers found.  Stopping after Stage 2.")
-        return
-
     citations_json = _p(folder, "citations.json")
     citations_csv  = _p(folder, "citing_papers.csv")
-    save_citations(author_name, all_citing, summary, citations_json, citations_csv)
+    citations_data = _load_json(citations_json)
+
+    if _is_complete(citations_data):
+        print(f"  Reusing completed citations.json from: {folder}")
+    else:
+        if citations_data and citations_data.get("enrich") is not None:
+            if citations_data.get("enrich") != enrich:
+                print("[ERROR] Cannot resume citations with a different "
+                      "--no-enrich setting. Rerun with the original option "
+                      "or remove citations.json.")
+                sys.exit(1)
+
+        all_citing, summary = track_citations(
+            papers_data, enrich=enrich, author_name=author_name,
+            json_path=citations_json, csv_path=citations_csv,
+            proxy_pool=proxy_pool,
+        )
+        citations_data = _load_json(citations_json)
+        if not all_citing:
+            print("[WARN] No citing papers found.  Stopping after Stage 2.")
+            return
+
+    if not citations_data.get("complete", True):
+        print("[ERROR] citations.json is incomplete; rerun to resume Stage 2.")
+        sys.exit(1)
+    if not citations_data.get("citations"):
+        print("[WARN] No citing papers found.  Stopping after Stage 2.")
+        return
 
     # ── Stage 3: build author profiles ───────────────────────────────────
     print("\n" + "=" * 60)
     print("STAGE 3 — Resolving author metadata (OpenAlex / S2 / CrossRef)")
     print("=" * 60)
 
-    with open(citations_json, encoding="utf-8") as f:
-        citations_data = json.load(f)
-
-    session = requests.Session()
-    all_records, not_found = build_author_profiles(citations_data, session)
-
     authors_json = _p(folder, "authors.json")
     authors_csv  = _p(folder, "authors.csv")
-    save_author_profiles(all_records, not_found, authors_json, authors_csv)
+    authors_data = _load_json(authors_json)
+
+    if _is_complete(authors_data):
+        print(f"  Reusing completed authors.json from: {folder}")
+    else:
+        session = make_session(proxy_pool)
+        all_records, not_found = build_author_profiles(
+            citations_data, session, authors_json, authors_csv,
+        )
+        authors_data = _load_json(authors_json)
+
+    if not authors_data.get("complete", True):
+        print("[ERROR] authors.json is incomplete; rerun to resume Stage 3.")
+        sys.exit(1)
 
     # ── Stage 4: rankings ─────────────────────────────────────────────────
     print("\n" + "=" * 60)
     print("STAGE 4 — Building author rankings")
     print("=" * 60)
-
-    with open(authors_json, encoding="utf-8") as f:
-        authors_data = json.load(f)
 
     cit_json  = _p(folder, "ranked_by_citations.json")
     cit_csv   = _p(folder, "ranked_by_citations.csv")
@@ -157,7 +232,8 @@ def run_pipeline(scholar_id: str, outdir: str,
         print("[INFO] h-index ranking skipped (--no-hindex flag set).")
         hidx_json = hidx_csv = None
     else:
-        run_rankings(authors_data, cit_json, cit_csv, hidx_json, hidx_csv)
+        run_rankings(authors_data, cit_json, cit_csv, hidx_json, hidx_csv,
+                     proxy_pool=proxy_pool)
 
     # ── Stage 5: summary + map ───────────────────────────────────────────
     print("\n" + "=" * 60)
@@ -215,15 +291,29 @@ def main() -> None:
         default=".",
         help="Parent directory for the output folder (default: current directory)",
     )
+    parser.add_argument(
+        "--proxy-config",
+        help="YAML file defining rotating Requests proxies",
+    )
 
     args = parser.parse_args()
 
-    run_pipeline(
-        scholar_id     = args.scholar_id,
-        outdir         = args.outdir,
-        enrich         = not args.no_enrich,
-        compute_hindex = not args.no_hindex,
-    )
+    try:
+        proxy_pool = load_proxy_pool(args.proxy_config) if args.proxy_config else None
+        run_pipeline(
+            scholar_id     = args.scholar_id,
+            outdir         = args.outdir,
+            enrich         = not args.no_enrich,
+            compute_hindex = not args.no_hindex,
+            proxy_pool     = proxy_pool,
+        )
+    except ProxyConfigError as e:
+        print(f"[ERROR] {e}")
+        sys.exit(1)
+    except RateLimitError as e:
+        print("\n[PAUSED] " + str(e))
+        print("Progress saved. Rerun the same command later to resume.")
+        sys.exit(2)
 
 
 if __name__ == "__main__":

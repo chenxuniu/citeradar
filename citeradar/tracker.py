@@ -28,6 +28,9 @@ from typing import Optional
 import requests
 from bs4 import BeautifulSoup
 
+from .errors import RateLimitError
+from .proxy import make_session
+
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -66,17 +69,61 @@ DELAY_SECONDS  = 2
 # HTTP helpers
 # ---------------------------------------------------------------------------
 
+def _looks_blocked_by_scholar(soup: BeautifulSoup) -> bool:
+    """Return True for Scholar CAPTCHA / unusual-traffic pages."""
+    if soup.select_one(
+        "form[action*='/sorry/'], input[name='captcha'], "
+        "#captcha, #captcha-form, .g-recaptcha, #gs_captcha_ccl"
+    ):
+        return True
+
+    text = soup.get_text(" ", strip=True).lower()
+    return any(phrase in text for phrase in (
+        "our systems have detected unusual traffic",
+        "not a robot",
+        "to continue, please type the characters",
+    ))
+
+
 def _get_soup(url: str, session: requests.Session) -> Optional[BeautifulSoup]:
     """GET a URL and return parsed HTML, with one 429-retry."""
-    resp = session.get(url, headers=HEADERS, timeout=15)
+    try:
+        resp = session.get(url, headers=HEADERS, timeout=15)
+    except requests.RequestException as e:
+        raise RateLimitError(f"Google Scholar request failed: {e}") from e
     if resp.status_code == 429:
         print("    [!] Rate-limited (HTTP 429) — waiting 30 s…")
         time.sleep(30)
-        resp = session.get(url, headers=HEADERS, timeout=15)
+        try:
+            resp = session.get(url, headers=HEADERS, timeout=15)
+        except requests.RequestException as e:
+            raise RateLimitError(f"Google Scholar request failed: {e}") from e
+        if resp.status_code == 429:
+            raise RateLimitError("Google Scholar rate limit while tracking citations")
     if resp.status_code != 200:
-        print(f"    [!] HTTP {resp.status_code} for {url}")
-        return None
-    return BeautifulSoup(resp.text, "html.parser")
+        raise RateLimitError(f"Google Scholar returned HTTP {resp.status_code} for {url}")
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    if _looks_blocked_by_scholar(soup):
+        print("    [!] Google Scholar returned a CAPTCHA/block page — waiting 30 s…")
+        time.sleep(30)
+        try:
+            resp = session.get(url, headers=HEADERS, timeout=15)
+        except requests.RequestException as e:
+            raise RateLimitError(f"Google Scholar request failed: {e}") from e
+        if resp.status_code == 429:
+            raise RateLimitError("Google Scholar rate limit while tracking citations")
+        if resp.status_code != 200:
+            raise RateLimitError(
+                f"Google Scholar returned HTTP {resp.status_code} for {url}"
+            )
+        soup = BeautifulSoup(resp.text, "html.parser")
+        if _looks_blocked_by_scholar(soup):
+            raise RateLimitError(
+                "Google Scholar returned a CAPTCHA/block page while tracking citations"
+            )
+
+    return soup
 
 
 # ---------------------------------------------------------------------------
@@ -249,20 +296,30 @@ def _has_next_page(soup: BeautifulSoup) -> bool:
 
 
 def _fetch_all_citing(cited_title: str, cited_by_url: str,
-                      session: requests.Session, enrich: bool) -> list[CitingPaper]:
+                      session: requests.Session, enrich: bool,
+                      expected_citations: int = 0, start: int = 0,
+                      on_page=None) -> list[CitingPaper]:
     """Paginate through all citing papers for a single paper."""
     all_citing: list[CitingPaper] = []
-    start = 0
     while True:
         soup = _get_soup(f"{cited_by_url}&start={start}", session)
         if soup is None:
             break
         page = _parse_citing_papers(soup, cited_title, session, enrich)
+        if not page and expected_citations > start:
+            raise RateLimitError(
+                "Google Scholar returned no citing results for "
+                f"'{cited_title}' despite {expected_citations} claimed citations"
+            )
         all_citing.extend(page)
         print(f"    [{start + 1}–{start + len(page)}] {len(page)} papers retrieved")
-        if not _has_next_page(soup):
+        has_next = _has_next_page(soup)
+        next_start = start + 10 if has_next else None
+        if has_next and on_page:
+            on_page(page, start, next_start)
+        if not has_next:
             break
-        start += 10
+        start = next_start
         time.sleep(DELAY_SECONDS)
     return all_citing
 
@@ -271,7 +328,72 @@ def _fetch_all_citing(cited_title: str, cited_by_url: str,
 # Public API
 # ---------------------------------------------------------------------------
 
-def track_citations(papers_data: dict, enrich: bool = True) -> tuple[list[CitingPaper], list[dict]]:
+def _paper_key(paper: dict) -> str:
+    """Stable key for resuming per-paper citation tracking."""
+    return paper.get("paper_url") or f"{paper.get('title', '')}|{paper.get('year', '')}"
+
+
+def _citation_dict(citation) -> dict:
+    return asdict(citation) if isinstance(citation, CitingPaper) else citation
+
+
+def _citation_from_dict(data: dict) -> CitingPaper:
+    fields = CitingPaper.__dataclass_fields__
+    return CitingPaper(**{k: data.get(k, "") for k in fields})
+
+
+def _dedupe_citations(citations: list[CitingPaper]) -> list[CitingPaper]:
+    seen: set[tuple[str, str, str, str]] = set()
+    deduped: list[CitingPaper] = []
+    for citation in citations:
+        data = _citation_dict(citation)
+        key = (
+            data.get("cited_paper_title", ""),
+            data.get("title", ""),
+            data.get("year", ""),
+            data.get("citing_url", ""),
+        )
+        if key not in seen:
+            seen.add(key)
+            deduped.append(_citation_from_dict(data))
+    return deduped
+
+
+def _load_citation_checkpoint(json_path: str, enrich: bool) -> tuple[
+    list[CitingPaper], list[dict], list[str], dict
+]:
+    if not json_path:
+        return [], [], [], {}
+    try:
+        with open(json_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return [], [], [], {}
+
+    if not data.get("complete", True) and data.get("enrich") is not None:
+        if data.get("enrich") != enrich:
+            raise ValueError(
+                "Cannot resume citations with a different --no-enrich setting. "
+                "Rerun with the original option or remove citations.json."
+            )
+
+    citations = [
+        _citation_from_dict(c)
+        for c in data.get("citations", [])
+        if isinstance(c, dict)
+    ]
+    return (
+        _dedupe_citations(citations),
+        data.get("summary", []),
+        data.get("processed_papers", []),
+        data.get("in_progress_paper", {}) if not data.get("complete", True) else {},
+    )
+
+
+def track_citations(papers_data: dict, enrich: bool = True,
+                    author_name: str = "", json_path: str = "",
+                    csv_path: str = "",
+                    proxy_pool=None) -> tuple[list[CitingPaper], list[dict]]:
     """
     For each paper in ``papers_data["papers"]`` that has citations, fetch all
     citing papers from Google Scholar.
@@ -295,62 +417,142 @@ def track_citations(papers_data: dict, enrich: bool = True) -> tuple[list[Citing
     print(f"Papers with citations: {len(cited_papers)} / {len(papers)}")
     print(f"CrossRef author enrichment: {'enabled' if enrich else 'disabled'}\n")
 
-    session     = requests.Session()
-    all_citing: list[CitingPaper] = []
-    summary:    list[dict]        = []
+    session = make_session(proxy_pool)
+    all_citing, summary, processed_papers, in_progress = _load_citation_checkpoint(
+        json_path, enrich
+    )
+    processed = set(processed_papers)
+
+    if processed:
+        print(f"Resuming citations: {len(processed)} papers already processed.\n")
+    if in_progress:
+        print(
+            "Resuming in-progress citation search: "
+            f"{in_progress.get('title', '')} "
+            f"at result offset {in_progress.get('next_start', 0)}.\n"
+        )
 
     for i, paper in enumerate(cited_papers, 1):
         title       = paper["title"]
         n_citations = paper["citations"]
+        key         = _paper_key(paper)
+
+        if key in processed:
+            print(f"[{i}/{len(cited_papers)}] {title}")
+            print("  Already processed — skipping.\n")
+            continue
+
         print(f"[{i}/{len(cited_papers)}] {title}")
         print(f"  Claimed citations: {n_citations}")
 
-        time.sleep(DELAY_SECONDS)
-        cited_by_url = _get_cited_by_url(paper["paper_url"], session)
+        resumed_paper = in_progress if in_progress.get("key") == key else {}
+        cited_by_url = resumed_paper.get("cited_by_url", "")
+        start = int(resumed_paper.get("next_start", 0) or 0)
+
+        if start and not any(c.cited_paper_title == title for c in all_citing):
+            start = 0
+
+        if cited_by_url:
+            print(f"  Resuming citing results at offset {start}.")
+        else:
+            time.sleep(DELAY_SECONDS)
+            cited_by_url = _get_cited_by_url(paper["paper_url"], session)
 
         if not cited_by_url:
-            print("  Could not find 'Cited by' link — skipping.\n")
-            continue
+            raise RateLimitError(
+                "Could not find 'Cited by' link for "
+                f"'{title}'. Google Scholar may have returned a CAPTCHA/block page."
+            )
+
+        def checkpoint_page(page: list[CitingPaper], page_start: int,
+                            next_start: int) -> None:
+            nonlocal all_citing
+            all_citing.extend(page)
+            all_citing = _dedupe_citations(all_citing)
+            if json_path and csv_path:
+                save_citations(
+                    author_name, all_citing, summary,
+                    json_path, csv_path, processed_papers,
+                    complete=False, enrich=enrich, quiet=True,
+                    in_progress={
+                        "key": key,
+                        "title": title,
+                        "cited_by_url": cited_by_url,
+                        "next_start": next_start,
+                    },
+                )
 
         time.sleep(DELAY_SECONDS)
-        citing = _fetch_all_citing(title, cited_by_url, session, enrich)
+        citing = _fetch_all_citing(
+            title, cited_by_url, session, enrich,
+            expected_citations=n_citations, start=start,
+            on_page=checkpoint_page,
+        )
         all_citing.extend(citing)
+        all_citing = _dedupe_citations(all_citing)
+        retrieved_citations = sum(
+            1 for c in all_citing if c.cited_paper_title == title
+        )
 
-        print(f"  → {len(citing)} citing papers retrieved.\n")
+        print(f"  → {retrieved_citations} citing papers retrieved.\n")
         summary.append({
             "your_paper":          title,
             "year":                paper["year"],
             "venue":               paper["venue"],
             "claimed_citations":   n_citations,
-            "retrieved_citations": len(citing),
+            "retrieved_citations": retrieved_citations,
         })
+        processed.add(key)
+        processed_papers.append(key)
+        if json_path and csv_path:
+            save_citations(author_name, all_citing, summary,
+                           json_path, csv_path, processed_papers,
+                           complete=False, enrich=enrich, quiet=True)
         time.sleep(DELAY_SECONDS)
+
+    if json_path and csv_path:
+        save_citations(author_name, all_citing, summary,
+                       json_path, csv_path, processed_papers,
+                       complete=True, enrich=enrich)
 
     return all_citing, summary
 
 
 def save_citations(author_name: str, all_citing: list[CitingPaper],
-                   summary: list[dict], json_path: str, csv_path: str) -> None:
+                   summary: list[dict], json_path: str, csv_path: str,
+                   processed_papers: Optional[list[str]] = None,
+                   complete: bool = True, enrich: Optional[bool] = None,
+                   quiet: bool = False,
+                   in_progress: Optional[dict] = None) -> None:
     """Persist citation data to JSON and CSV."""
+    data = [_citation_dict(c) for c in _dedupe_citations(all_citing)]
+    processed_papers = list(dict.fromkeys(processed_papers or []))
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(
             {
                 "author":               author_name,
-                "total_citing_papers":  len(all_citing),
-                "citations":            [asdict(c) for c in all_citing],
+                "total_citing_papers":  len(data),
+                "complete":             complete,
+                "enrich":               enrich,
+                "processed_papers":     processed_papers,
+                "in_progress_paper":    in_progress or {},
+                "summary":              summary,
+                "citations":            data,
             },
             f, ensure_ascii=False, indent=2,
         )
 
-    if all_citing:
-        fields = list(asdict(all_citing[0]).keys())
-        with open(csv_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fields)
-            writer.writeheader()
-            writer.writerows(asdict(c) for c in all_citing)
+    fields = list(CitingPaper.__dataclass_fields__.keys())
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(data)
 
-    print(f"\nCitations saved → {json_path}, {csv_path}")
-    print(f"\nRetrieval summary:")
-    for s in summary:
-        print(f"  [{s['claimed_citations']:>3} cited / "
-              f"{s['retrieved_citations']:>3} retrieved]  {s['your_paper']}")
+    if quiet:
+        print(f"  Checkpoint saved → {json_path}")
+    else:
+        print(f"\nCitations saved → {json_path}, {csv_path}")
+        print(f"\nRetrieval summary:")
+        for s in summary:
+            print(f"  [{s['claimed_citations']:>3} cited / "
+                  f"{s['retrieved_citations']:>3} retrieved]  {s['your_paper']}")

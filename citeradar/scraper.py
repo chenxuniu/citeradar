@@ -20,6 +20,9 @@ from typing import Optional
 import requests
 from bs4 import BeautifulSoup
 
+from .errors import RateLimitError
+from .proxy import make_session
+
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -63,12 +66,20 @@ def _fetch_page(user_id: str, start: int, session: requests.Session) -> Optional
         f"{BASE_URL}/citations"
         f"?user={user_id}&sortby=pubdate&pagesize={PAGE_SIZE}&cstart={start}"
     )
-    resp = session.get(url, headers=HEADERS, timeout=15)
+    try:
+        resp = session.get(url, headers=HEADERS, timeout=15)
+    except requests.RequestException as e:
+        raise RateLimitError(f"Google Scholar request failed: {e}") from e
 
     if resp.status_code == 429:
         print("  [!] Rate-limited (HTTP 429). Waiting 30 s before retry…")
         time.sleep(30)
-        resp = session.get(url, headers=HEADERS, timeout=15)
+        try:
+            resp = session.get(url, headers=HEADERS, timeout=15)
+        except requests.RequestException as e:
+            raise RateLimitError(f"Google Scholar request failed: {e}") from e
+        if resp.status_code == 429:
+            raise RateLimitError("Google Scholar rate limit while scraping profile")
 
     if resp.status_code != 200:
         print(f"  [!] HTTP {resp.status_code} for {url}")
@@ -127,7 +138,7 @@ def _has_more_pages(soup: BeautifulSoup, page_papers: int) -> bool:
 # Public API
 # ---------------------------------------------------------------------------
 
-def scrape_profile(user_id: str) -> tuple[dict, list[Paper]]:
+def scrape_profile(user_id: str, proxy_pool=None) -> tuple[dict, list[Paper]]:
     """
     Scrape all papers from a Google Scholar profile.
 
@@ -143,7 +154,7 @@ def scrape_profile(user_id: str) -> tuple[dict, list[Paper]]:
     papers : list[Paper]
         All papers found on the profile, sorted by publication date.
     """
-    session     = requests.Session()
+    session     = make_session(proxy_pool)
     all_papers: list[Paper] = []
     author_info = {}
     start       = 0
@@ -177,11 +188,13 @@ def scrape_profile(user_id: str) -> tuple[dict, list[Paper]]:
 
 
 def save_papers(author_info: dict, papers: list[Paper],
-                json_path: str, csv_path: str) -> None:
+                json_path: str, csv_path: str, scholar_id: str = "") -> None:
     """Persist papers to JSON and CSV."""
     data = {
         "author":       author_info,
+        "scholar_id":   scholar_id,
         "total_papers": len(papers),
+        "complete":     True,
         "papers":       [asdict(p) for p in papers],
     }
     with open(json_path, "w", encoding="utf-8") as f:
